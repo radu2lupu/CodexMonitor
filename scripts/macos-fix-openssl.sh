@@ -36,6 +36,7 @@ libssl="${openssl_prefix}/lib/libssl.3.dylib"
 libcrypto="${openssl_prefix}/lib/libcrypto.3.dylib"
 frameworks_dir="${app_path}/Contents/Frameworks"
 bin_path="${app_path}/Contents/MacOS/codex-monitor"
+daemon_path="${app_path}/Contents/MacOS/codex_monitor_daemon"
 
 if [[ ! -f "${libssl}" || ! -f "${libcrypto}" ]]; then
   echo "OpenSSL dylibs not found at ${openssl_prefix}/lib"
@@ -78,8 +79,12 @@ if ! otool -l "${bin_path}" | { command -v rg >/dev/null 2>&1 && rg -q "@executa
   install_name_tool -add_rpath "@executable_path/../Frameworks" "${bin_path}"
 fi
 
-codesign --force --options runtime --sign "${identity}" "${frameworks_dir}/libcrypto.3.dylib"
-codesign --force --options runtime --sign "${identity}" "${frameworks_dir}/libssl.3.dylib"
-codesign --force --options runtime --sign "${identity}" "${app_path}"
+codesign --force --options runtime --timestamp --sign "${identity}" "${frameworks_dir}/libcrypto.3.dylib"
+codesign --force --options runtime --timestamp --sign "${identity}" "${frameworks_dir}/libssl.3.dylib"
+codesign --force --options runtime --timestamp --sign "${identity}" "${bin_path}"
+if [[ -f "${daemon_path}" ]]; then
+  codesign --force --options runtime --timestamp --sign "${identity}" "${daemon_path}"
+fi
+codesign --force --options runtime --timestamp --sign "${identity}" "${app_path}"
 
 echo "Bundled OpenSSL dylibs and re-signed ${app_path}"
