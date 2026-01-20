@@ -1,5 +1,7 @@
 use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem, Submenu};
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod backend;
 mod codex;
@@ -16,6 +18,7 @@ mod git;
 mod git_utils;
 mod local_usage;
 mod prompts;
+mod remote_backend;
 mod rules;
 mod settings;
 mod state;
@@ -42,12 +45,19 @@ pub fn run() {
             let app_name = handle.package_info().name.clone();
             let about_item = MenuItemBuilder::with_id("about", format!("About {app_name}"))
                 .build(handle)?;
+            let check_updates_item =
+                MenuItemBuilder::with_id("check_for_updates", "Check for Updates...")
+                    .build(handle)?;
+            let settings_item =
+                MenuItemBuilder::with_id("file_open_settings", "Settings...").build(handle)?;
             let app_menu = Submenu::with_items(
                 handle,
                 app_name.clone(),
                 true,
                 &[
                     &about_item,
+                    &check_updates_item,
+                    &settings_item,
                     &PredefinedMenuItem::separator(handle)?,
                     &PredefinedMenuItem::services(handle, None)?,
                     &PredefinedMenuItem::separator(handle)?,
@@ -58,6 +68,17 @@ pub fn run() {
                 ],
             )?;
 
+            let new_agent_item =
+                MenuItemBuilder::with_id("file_new_agent", "New Agent").build(handle)?;
+            let new_worktree_agent_item =
+                MenuItemBuilder::with_id("file_new_worktree_agent", "New Worktree Agent")
+                    .build(handle)?;
+            let new_clone_agent_item =
+                MenuItemBuilder::with_id("file_new_clone_agent", "New Clone Agent")
+                    .build(handle)?;
+            let add_workspace_item =
+                MenuItemBuilder::with_id("file_add_workspace", "Add Workspace...").build(handle)?;
+
             #[cfg(target_os = "linux")]
             let file_menu = {
                 let close_window_item =
@@ -67,7 +88,16 @@ pub fn run() {
                     handle,
                     "File",
                     true,
-                    &[&close_window_item, &quit_item],
+                    &[
+                        &new_agent_item,
+                        &new_worktree_agent_item,
+                        &new_clone_agent_item,
+                        &PredefinedMenuItem::separator(handle)?,
+                        &add_workspace_item,
+                        &PredefinedMenuItem::separator(handle)?,
+                        &close_window_item,
+                        &quit_item,
+                    ],
                 )?
             };
             #[cfg(not(target_os = "linux"))]
@@ -76,6 +106,12 @@ pub fn run() {
                 "File",
                 true,
                 &[
+                    &new_agent_item,
+                    &new_worktree_agent_item,
+                    &new_clone_agent_item,
+                    &PredefinedMenuItem::separator(handle)?,
+                    &add_workspace_item,
+                    &PredefinedMenuItem::separator(handle)?,
                     &PredefinedMenuItem::close_window(handle, None)?,
                     #[cfg(not(target_os = "macos"))]
                     &PredefinedMenuItem::quit(handle, None)?,
@@ -185,6 +221,24 @@ pub fn run() {
                     .inner_size(360.0, 240.0)
                     .center()
                     .build();
+                }
+                "check_for_updates" => {
+                    let _ = app.emit("updater-check", ());
+                }
+                "file_new_agent" => {
+                    emit_menu_event(app, "menu-new-agent");
+                }
+                "file_new_worktree_agent" => {
+                    emit_menu_event(app, "menu-new-worktree-agent");
+                }
+                "file_new_clone_agent" => {
+                    emit_menu_event(app, "menu-new-clone-agent");
+                }
+                "file_add_workspace" => {
+                    emit_menu_event(app, "menu-add-workspace");
+                }
+                "file_open_settings" => {
+                    emit_menu_event(app, "menu-open-settings");
                 }
                 "file_close_window" | "window_close" => {
                     if let Some(window) = app.get_webview_window("main") {
@@ -297,4 +351,21 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+#[derive(Clone, Serialize)]
+struct MenuEventPayload {
+    id: u64,
+}
+
+static MENU_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn emit_menu_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &str) {
+    let payload = MenuEventPayload {
+        id: MENU_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed),
+    };
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit(event, payload);
+    } else {
+        let _ = app.emit(event, payload);
+    }
 }

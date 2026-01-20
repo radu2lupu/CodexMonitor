@@ -4,7 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceInfo } from "../../../types";
 import type { useAppServerEvents } from "../../app/hooks/useAppServerEvents";
 import { useThreadRows } from "../../app/hooks/useThreadRows";
-import { listThreads, resumeThread, sendUserMessage } from "../../../services/tauri";
+import {
+  interruptTurn,
+  listThreads,
+  resumeThread,
+  sendUserMessage,
+} from "../../../services/tauri";
 import { useThreads } from "./useThreads";
 
 type AppServerHandlers = Parameters<typeof useAppServerEvents>[0];
@@ -165,6 +170,178 @@ describe("useThreads UX integration", () => {
     if (assistantMerged?.kind === "message") {
       expect(assistantMerged.text).toBe("Hello world");
     }
+  });
+
+  it("keeps the latest plan visible when a new turn starts", () => {
+    const { result } = renderHook(() =>
+      useThreads({
+        activeWorkspace: workspace,
+        onWorkspaceConnected: vi.fn(),
+      }),
+    );
+
+    act(() => {
+      handlers?.onTurnPlanUpdated?.("ws-1", "thread-1", "turn-1", {
+        explanation: " Plan note ",
+        plan: [{ step: "Do it", status: "in_progress" }],
+      });
+    });
+
+    expect(result.current.planByThread["thread-1"]).toEqual({
+      turnId: "turn-1",
+      explanation: "Plan note",
+      steps: [{ step: "Do it", status: "inProgress" }],
+    });
+
+    act(() => {
+      handlers?.onTurnStarted?.("ws-1", "thread-1", "turn-2");
+    });
+
+    expect(result.current.planByThread["thread-1"]).toEqual({
+      turnId: "turn-1",
+      explanation: "Plan note",
+      steps: [{ step: "Do it", status: "inProgress" }],
+    });
+  });
+
+  it("clears empty plan updates to null", () => {
+    const { result } = renderHook(() =>
+      useThreads({
+        activeWorkspace: workspace,
+        onWorkspaceConnected: vi.fn(),
+      }),
+    );
+
+    act(() => {
+      handlers?.onTurnPlanUpdated?.("ws-1", "thread-1", "turn-1", {
+        explanation: "   ",
+        plan: [],
+      });
+    });
+
+    expect(result.current.planByThread["thread-1"]).toBeNull();
+  });
+
+  it("normalizes plan step status values", () => {
+    const { result } = renderHook(() =>
+      useThreads({
+        activeWorkspace: workspace,
+        onWorkspaceConnected: vi.fn(),
+      }),
+    );
+
+    act(() => {
+      handlers?.onTurnPlanUpdated?.("ws-1", "thread-1", "turn-1", {
+        explanation: "",
+        plan: [
+          { step: "Step 1", status: "in_progress" },
+          { step: "Step 2", status: "in-progress" },
+          { step: "Step 3", status: "in progress" },
+          { step: "Step 4", status: "completed" },
+          { step: "Step 5", status: "unknown" },
+        ],
+      });
+    });
+
+    expect(result.current.planByThread["thread-1"]).toEqual({
+      turnId: "turn-1",
+      explanation: null,
+      steps: [
+        { step: "Step 1", status: "inProgress" },
+        { step: "Step 2", status: "inProgress" },
+        { step: "Step 3", status: "inProgress" },
+        { step: "Step 4", status: "completed" },
+        { step: "Step 5", status: "pending" },
+      ],
+    });
+  });
+
+  it("replaces the plan when a new turn updates it", () => {
+    const { result } = renderHook(() =>
+      useThreads({
+        activeWorkspace: workspace,
+        onWorkspaceConnected: vi.fn(),
+      }),
+    );
+
+    act(() => {
+      handlers?.onTurnPlanUpdated?.("ws-1", "thread-1", "turn-1", {
+        explanation: "First plan",
+        plan: [{ step: "Step 1", status: "pending" }],
+      });
+      handlers?.onTurnPlanUpdated?.("ws-1", "thread-1", "turn-2", {
+        explanation: "Next plan",
+        plan: [{ step: "Step 2", status: "completed" }],
+      });
+    });
+
+    expect(result.current.planByThread["thread-1"]).toEqual({
+      turnId: "turn-2",
+      explanation: "Next plan",
+      steps: [{ step: "Step 2", status: "completed" }],
+    });
+  });
+
+  it("keeps plans isolated per thread", () => {
+    const { result } = renderHook(() =>
+      useThreads({
+        activeWorkspace: workspace,
+        onWorkspaceConnected: vi.fn(),
+      }),
+    );
+
+    act(() => {
+      handlers?.onTurnPlanUpdated?.("ws-1", "thread-1", "turn-1", {
+        explanation: "Thread 1 plan",
+        plan: [{ step: "Step 1", status: "pending" }],
+      });
+      handlers?.onTurnPlanUpdated?.("ws-1", "thread-2", "turn-2", {
+        explanation: "Thread 2 plan",
+        plan: [{ step: "Step 2", status: "completed" }],
+      });
+    });
+
+    expect(result.current.planByThread["thread-1"]).toEqual({
+      turnId: "turn-1",
+      explanation: "Thread 1 plan",
+      steps: [{ step: "Step 1", status: "pending" }],
+    });
+    expect(result.current.planByThread["thread-2"]).toEqual({
+      turnId: "turn-2",
+      explanation: "Thread 2 plan",
+      steps: [{ step: "Step 2", status: "completed" }],
+    });
+  });
+
+  it("interrupts immediately even before a turn id is available", async () => {
+    const interruptMock = vi.mocked(interruptTurn);
+    interruptMock.mockResolvedValue({ result: {} });
+
+    const { result } = renderHook(() =>
+      useThreads({
+        activeWorkspace: workspace,
+        onWorkspaceConnected: vi.fn(),
+      }),
+    );
+
+    act(() => {
+      result.current.setActiveThreadId("thread-1");
+    });
+
+    await act(async () => {
+      await result.current.interruptTurn();
+    });
+
+    expect(interruptMock).toHaveBeenCalledWith("ws-1", "thread-1", "pending");
+
+    act(() => {
+      handlers?.onTurnStarted?.("ws-1", "thread-1", "turn-1");
+    });
+
+    await waitFor(() => {
+      expect(interruptMock).toHaveBeenCalledWith("ws-1", "thread-1", "turn-1");
+    });
+    expect(interruptMock).toHaveBeenCalledTimes(2);
   });
 
   it("orders thread lists, applies custom names, and keeps pin ordering stable", async () => {
