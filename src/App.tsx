@@ -92,6 +92,7 @@ import { useCopyThread } from "./features/threads/hooks/useCopyThread";
 import { usePanelVisibility } from "./features/layout/hooks/usePanelVisibility";
 import { useTerminalController } from "./features/terminal/hooks/useTerminalController";
 import { playNotificationSound } from "./utils/notificationSounds";
+import { shouldApplyCommitMessage } from "./utils/commitMessage";
 import {
   pickWorkspacePath,
   generateCommitMessage,
@@ -946,19 +947,19 @@ function MainApp() {
     try {
       // Generate commit message in background
       const message = await generateCommitMessage(workspaceId);
-      if (activeWorkspaceIdRef.current !== workspaceId) {
+      if (!shouldApplyCommitMessage(activeWorkspaceIdRef.current, workspaceId)) {
         return;
       }
       setCommitMessage(message);
     } catch (error) {
-      if (activeWorkspaceIdRef.current !== workspaceId) {
+      if (!shouldApplyCommitMessage(activeWorkspaceIdRef.current, workspaceId)) {
         return;
       }
       setCommitMessageError(
         error instanceof Error ? error.message : String(error)
       );
     } finally {
-      if (activeWorkspaceIdRef.current === workspaceId) {
+      if (shouldApplyCommitMessage(activeWorkspaceIdRef.current, workspaceId)) {
         setCommitMessageLoading(false);
       }
     }

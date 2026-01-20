@@ -158,6 +158,44 @@ fn build_combined_diff(diff: &git2::Diff) -> String {
     combined_diff
 }
 
+fn collect_workspace_diff(repo_root: &Path) -> Result<String, String> {
+    let repo = Repository::open(repo_root).map_err(|e| e.to_string())?;
+    let head_tree = repo
+        .head()
+        .ok()
+        .and_then(|head| head.peel_to_tree().ok());
+
+    let mut options = DiffOptions::new();
+    let index = repo.index().map_err(|e| e.to_string())?;
+    let diff = match head_tree.as_ref() {
+        Some(tree) => repo
+            .diff_tree_to_index(Some(tree), Some(&index), Some(&mut options))
+            .map_err(|e| e.to_string())?,
+        None => repo
+            .diff_tree_to_index(None, Some(&index), Some(&mut options))
+            .map_err(|e| e.to_string())?,
+    };
+    let combined_diff = build_combined_diff(&diff);
+    if !combined_diff.trim().is_empty() {
+        return Ok(combined_diff);
+    }
+
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+    let diff = match head_tree.as_ref() {
+        Some(tree) => repo
+            .diff_tree_to_workdir_with_index(Some(tree), Some(&mut options))
+            .map_err(|e| e.to_string())?,
+        None => repo
+            .diff_tree_to_workdir_with_index(None, Some(&mut options))
+            .map_err(|e| e.to_string())?,
+    };
+    Ok(build_combined_diff(&diff))
+}
+
 fn github_repo_from_path(path: &Path) -> Result<String, String> {
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
     let remotes = repo.remotes().map_err(|e| e.to_string())?;
@@ -570,42 +608,7 @@ pub(crate) async fn get_workspace_diff(
     drop(workspaces);
 
     let repo_root = resolve_git_root(&entry)?;
-    let repo = Repository::open(&repo_root).map_err(|e| e.to_string())?;
-    let head_tree = repo
-        .head()
-        .ok()
-        .and_then(|head| head.peel_to_tree().ok());
-
-    let mut options = DiffOptions::new();
-    let index = repo.index().map_err(|e| e.to_string())?;
-    let diff = match head_tree.as_ref() {
-        Some(tree) => repo
-            .diff_tree_to_index(Some(tree), Some(&index), Some(&mut options))
-            .map_err(|e| e.to_string())?,
-        None => repo
-            .diff_tree_to_index(None, Some(&index), Some(&mut options))
-            .map_err(|e| e.to_string())?,
-    };
-    let combined_diff = build_combined_diff(&diff);
-    if !combined_diff.trim().is_empty() {
-        return Ok(combined_diff);
-    }
-
-    let mut options = DiffOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .show_untracked_content(true);
-    let diff = match head_tree.as_ref() {
-        Some(tree) => repo
-            .diff_tree_to_workdir_with_index(Some(tree), Some(&mut options))
-            .map_err(|e| e.to_string())?,
-        None => repo
-            .diff_tree_to_workdir_with_index(None, Some(&mut options))
-            .map_err(|e| e.to_string())?,
-    };
-
-    Ok(build_combined_diff(&diff))
+    collect_workspace_diff(&repo_root)
 }
 
 #[tauri::command]
@@ -1119,4 +1122,45 @@ pub(crate) async fn create_git_branch(
     repo.branch(&name, &target, false)
         .map_err(|e| e.to_string())?;
     checkout_branch(&repo, &name).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn create_temp_repo() -> (PathBuf, Repository) {
+        let root = std::env::temp_dir().join(format!(
+            "codex-monitor-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create temp repo root");
+        let repo = Repository::init(&root).expect("init repo");
+        (root, repo)
+    }
+
+    #[test]
+    fn collect_workspace_diff_prefers_staged_changes() {
+        let (root, repo) = create_temp_repo();
+        let file_path = root.join("staged.txt");
+        fs::write(&file_path, "staged\n").expect("write staged file");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("staged.txt")).expect("add path");
+        index.write().expect("write index");
+
+        let diff = collect_workspace_diff(&root).expect("collect diff");
+        assert!(diff.contains("staged.txt"));
+        assert!(diff.contains("staged"));
+    }
+
+    #[test]
+    fn collect_workspace_diff_falls_back_to_workdir() {
+        let (root, _repo) = create_temp_repo();
+        let file_path = root.join("unstaged.txt");
+        fs::write(&file_path, "unstaged\n").expect("write unstaged file");
+
+        let diff = collect_workspace_diff(&root).expect("collect diff");
+        assert!(diff.contains("unstaged.txt"));
+        assert!(diff.contains("unstaged"));
+    }
 }
