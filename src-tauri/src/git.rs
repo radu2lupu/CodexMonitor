@@ -478,17 +478,13 @@ pub(crate) async fn get_workspace_diff(
         .and_then(|head| head.peel_to_tree().ok());
 
     let mut options = DiffOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .show_untracked_content(true);
-
+    let index = repo.index().map_err(|e| e.to_string())?;
     let diff = match head_tree.as_ref() {
         Some(tree) => repo
-            .diff_tree_to_workdir_with_index(Some(tree), Some(&mut options))
+            .diff_tree_to_index(Some(tree), Some(&index), Some(&mut options))
             .map_err(|e| e.to_string())?,
         None => repo
-            .diff_tree_to_workdir_with_index(None, Some(&mut options))
+            .diff_tree_to_index(None, Some(&index), Some(&mut options))
             .map_err(|e| e.to_string())?,
     };
 

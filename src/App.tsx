@@ -981,12 +981,14 @@ function MainApp() {
     if (!activeWorkspace || commitLoading || pushLoading || !commitMessage.trim()) {
       return;
     }
+    let commitSucceeded = false;
     setCommitLoading(true);
     setPushLoading(true);
     setCommitError(null);
     setPushError(null);
     try {
       await commitGit(activeWorkspace.id, commitMessage.trim());
+      commitSucceeded = true;
       setCommitMessage("");
       setCommitLoading(false);
       await pushGit(activeWorkspace.id);
@@ -995,7 +997,7 @@ function MainApp() {
       refreshGitLog?.();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      if (commitLoading) {
+      if (!commitSucceeded) {
         setCommitError(errorMsg);
       } else {
         setPushError(errorMsg);
@@ -1010,12 +1012,14 @@ function MainApp() {
     if (!activeWorkspace || commitLoading || syncLoading || !commitMessage.trim()) {
       return;
     }
+    let commitSucceeded = false;
     setCommitLoading(true);
     setSyncLoading(true);
     setCommitError(null);
     setSyncError(null);
     try {
       await commitGit(activeWorkspace.id, commitMessage.trim());
+      commitSucceeded = true;
       setCommitMessage("");
       setCommitLoading(false);
       await syncGit(activeWorkspace.id);
@@ -1024,7 +1028,7 @@ function MainApp() {
       refreshGitLog?.();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      if (commitLoading) {
+      if (!commitSucceeded) {
         setCommitError(errorMsg);
       } else {
         setSyncError(errorMsg);

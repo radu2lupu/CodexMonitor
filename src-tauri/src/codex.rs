@@ -669,7 +669,34 @@ Changes:\n{diff}"
         "approvalPolicy": "never",
         "sandboxPolicy": { "type": "readOnly" },
     });
-    session.send_request("turn/start", turn_params).await?;
+    let turn_result = session.send_request("turn/start", turn_params).await;
+    let turn_result = match turn_result {
+        Ok(result) => result,
+        Err(error) => {
+            // Clean up if turn fails to start
+            {
+                let mut callbacks = session.background_thread_callbacks.lock().await;
+                callbacks.remove(&thread_id);
+            }
+            let archive_params = json!({ "threadId": thread_id.as_str() });
+            let _ = session.send_request("thread/archive", archive_params).await;
+            return Err(error);
+        }
+    };
+
+    if let Some(error) = turn_result.get("error") {
+        let error_msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error starting turn");
+        {
+            let mut callbacks = session.background_thread_callbacks.lock().await;
+            callbacks.remove(&thread_id);
+        }
+        let archive_params = json!({ "threadId": thread_id.as_str() });
+        let _ = session.send_request("thread/archive", archive_params).await;
+        return Err(error_msg.to_string());
+    }
 
     // Collect assistant text from events
     let mut commit_message = String::new();

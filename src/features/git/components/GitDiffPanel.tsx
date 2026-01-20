@@ -14,7 +14,7 @@ import {
   Search,
   Upload,
 } from "lucide-react";
-import { useState, useCallback } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { formatRelativeTime } from "../../../utils/time";
 import { PanelTabs, type PanelTabId } from "../../layout/components/PanelTabs";
 
@@ -311,7 +311,13 @@ export function GitDiffPanel({
   const [lastClickedFile, setLastClickedFile] = useState<string | null>(null);
 
   // Combine staged and unstaged files for range selection
-  const allFiles = [...stagedFiles.map(f => ({ ...f, section: "staged" as const })), ...unstagedFiles.map(f => ({ ...f, section: "unstaged" as const }))];
+  const allFiles = useMemo(
+    () => [
+      ...stagedFiles.map(f => ({ ...f, section: "staged" as const })),
+      ...unstagedFiles.map(f => ({ ...f, section: "unstaged" as const })),
+    ],
+    [stagedFiles, unstagedFiles],
+  );
 
   const handleFileClick = useCallback((
     event: ReactMouseEvent<HTMLDivElement>,
