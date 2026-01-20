@@ -42,6 +42,57 @@ async fn run_git_command(repo_root: &Path, args: &[&str]) -> Result<(), String> 
     Err(detail.to_string())
 }
 
+fn parse_upstream_ref(name: &str) -> Option<(String, String)> {
+    let trimmed = name.strip_prefix("refs/remotes/").unwrap_or(name);
+    let mut parts = trimmed.splitn(2, '/');
+    let remote = parts.next()?;
+    let branch = parts.next()?;
+    if remote.is_empty() || branch.is_empty() {
+        return None;
+    }
+    Some((remote.to_string(), branch.to_string()))
+}
+
+fn upstream_remote_and_branch(repo_root: &Path) -> Result<Option<(String, String)>, String> {
+    let repo = Repository::open(repo_root).map_err(|e| e.to_string())?;
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(_) => return Ok(None),
+    };
+    if !head.is_branch() {
+        return Ok(None);
+    }
+    let branch_name = match head.shorthand() {
+        Some(name) => name,
+        None => return Ok(None),
+    };
+    let branch = repo
+        .find_branch(branch_name, BranchType::Local)
+        .map_err(|e| e.to_string())?;
+    let upstream_branch = match branch.upstream() {
+        Ok(upstream) => upstream,
+        Err(_) => return Ok(None),
+    };
+    let upstream_ref = upstream_branch.get();
+    let upstream_name = upstream_ref
+        .name()
+        .or_else(|| upstream_ref.shorthand());
+    Ok(upstream_name.and_then(parse_upstream_ref))
+}
+
+async fn push_with_upstream(repo_root: &Path) -> Result<(), String> {
+    let upstream = upstream_remote_and_branch(repo_root)?;
+    if let Some((remote, branch)) = upstream {
+        let refspec = format!("HEAD:{branch}");
+        return run_git_command(
+            repo_root,
+            &["push", remote.as_str(), refspec.as_str()],
+        )
+        .await;
+    }
+    run_git_command(repo_root, &["push"]).await
+}
+
 fn status_for_index(status: Status) -> Option<&'static str> {
     if status.contains(Status::INDEX_NEW) {
         Some("A")
@@ -406,7 +457,7 @@ pub(crate) async fn push_git(
         .clone();
 
     let repo_root = resolve_git_root(&entry)?;
-    run_git_command(&repo_root, &["push"]).await
+    push_with_upstream(&repo_root).await
 }
 
 #[tauri::command]
@@ -438,7 +489,7 @@ pub(crate) async fn sync_git(
     let repo_root = resolve_git_root(&entry)?;
     // Pull first, then push (like VSCode sync)
     run_git_command(&repo_root, &["pull"]).await?;
-    run_git_command(&repo_root, &["push"]).await
+    push_with_upstream(&repo_root).await
 }
 
 #[tauri::command]
