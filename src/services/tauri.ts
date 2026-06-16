@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
+  AgentBackend,
   AppSettings,
   CodexDoctorResult,
   DictationModelStatus,
@@ -51,8 +52,13 @@ export async function listWorkspaces(): Promise<WorkspaceInfo[]> {
 export async function addWorkspace(
   path: string,
   codex_bin: string | null,
+  agentBackend?: AgentBackend,
 ): Promise<WorkspaceInfo> {
-  return invoke<WorkspaceInfo>("add_workspace", { path, codex_bin });
+  return invoke<WorkspaceInfo>("add_workspace", {
+    path,
+    codex_bin,
+    agent_backend: agentBackend,
+  });
 }
 
 export async function addClone(
@@ -108,8 +114,8 @@ export async function connectWorkspace(id: string): Promise<void> {
   return invoke("connect_workspace", { id });
 }
 
-export async function startThread(workspaceId: string) {
-  return invoke<any>("start_thread", { workspaceId });
+export async function startThread(workspaceId: string, backend?: AgentBackend) {
+  return invoke<any>("start_thread", { workspaceId, backend: backend ?? null });
 }
 
 export async function sendUserMessage(

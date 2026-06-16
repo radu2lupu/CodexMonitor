@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
+  AgentBackend,
   AppSettings,
   DebugEntry,
   WorkspaceGroup,
@@ -203,7 +204,7 @@ export function useWorkspaces(options: UseWorkspacesOptions = {}) {
     [getWorkspaceGroupId, workspaceById, workspaceGroupById],
   );
 
-  async function addWorkspace() {
+  async function addWorkspace(agentBackend?: AgentBackend) {
     const selection = await pickWorkspacePath();
     if (!selection) {
       return null;
@@ -213,10 +214,14 @@ export function useWorkspaces(options: UseWorkspacesOptions = {}) {
       timestamp: Date.now(),
       source: "client",
       label: "workspace/add",
-      payload: { path: selection },
+      payload: { path: selection, agentBackend },
     });
     try {
-      const workspace = await addWorkspaceService(selection, defaultCodexBin ?? null);
+      const workspace = await addWorkspaceService(
+        selection,
+        defaultCodexBin ?? null,
+        agentBackend,
+      );
       setWorkspaces((prev) => [...prev, workspace]);
       setActiveWorkspaceId(workspace.id);
       return workspace;

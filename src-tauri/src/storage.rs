@@ -67,6 +67,7 @@ mod tests {
             parent_id: None,
             worktree: None,
             settings: settings.clone(),
+            agent_backend: crate::types::AgentBackend::default(),
         };
 
         write_workspaces(&path, &[entry]).expect("write workspaces");

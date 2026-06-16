@@ -100,6 +100,14 @@ export function ThreadList({
       >
         <span className={`thread-status ${statusClass}`} aria-hidden />
         {isPinned && <span className="thread-pin-icon" aria-label="Pinned">📌</span>}
+        {thread.backend && (
+          <span
+            className={`thread-backend-badge ${thread.backend === "claudecode" ? "claude" : "codex"}`}
+            title={thread.backend === "claudecode" ? "Claude Code" : "Codex"}
+          >
+            {thread.backend === "claudecode" ? "C" : "X"}
+          </span>
+        )}
         <span className="thread-name">{thread.name}</span>
         <div className="thread-meta">
           {relativeTime && <span className="thread-time">{relativeTime}</span>}

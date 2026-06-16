@@ -164,6 +164,8 @@ pub(crate) struct WorkspaceEntry {
     pub(crate) worktree: Option<WorktreeInfo>,
     #[serde(default)]
     pub(crate) settings: WorkspaceSettings,
+    #[serde(default, rename = "agentBackend")]
+    pub(crate) agent_backend: AgentBackend,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -181,6 +183,8 @@ pub(crate) struct WorkspaceInfo {
     pub(crate) worktree: Option<WorktreeInfo>,
     #[serde(default)]
     pub(crate) settings: WorkspaceSettings,
+    #[serde(default, rename = "agentBackend")]
+    pub(crate) agent_backend: AgentBackend,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -188,6 +192,19 @@ pub(crate) struct WorkspaceInfo {
 pub(crate) enum WorkspaceKind {
     Main,
     Worktree,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AgentBackend {
+    Codex,
+    ClaudeCode,
+}
+
+impl Default for AgentBackend {
+    fn default() -> Self {
+        AgentBackend::Codex
+    }
 }
 
 impl Default for WorkspaceKind {

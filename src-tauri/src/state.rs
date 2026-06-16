@@ -5,13 +5,57 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex;
 
+use crate::backend::app_server::WorkspaceSession as CodexSession;
+use crate::backend::claude_code::ClaudeCodeSession;
 use crate::dictation::DictationState;
 use crate::storage::{read_settings, read_workspaces};
 use crate::types::{AppSettings, WorkspaceEntry};
 
+/// Unified session type that can hold either a Codex or Claude Code session
+pub(crate) enum AgentSession {
+    Codex(Arc<CodexSession>),
+    ClaudeCode(Arc<ClaudeCodeSession>),
+}
+
+impl AgentSession {
+    pub(crate) fn as_codex(&self) -> Option<&Arc<CodexSession>> {
+        match self {
+            AgentSession::Codex(session) => Some(session),
+            AgentSession::ClaudeCode(_) => None,
+        }
+    }
+
+    pub(crate) fn as_claude_code(&self) -> Option<&Arc<ClaudeCodeSession>> {
+        match self {
+            AgentSession::Codex(_) => None,
+            AgentSession::ClaudeCode(session) => Some(session),
+        }
+    }
+
+    /// Kill the underlying child process for this session
+    pub(crate) async fn kill_child(&self) {
+        match self {
+            AgentSession::Codex(session) => {
+                let mut child = session.child.lock().await;
+                let _ = child.kill().await;
+            }
+            AgentSession::ClaudeCode(session) => {
+                let mut child = session.child.lock().await;
+                let _ = child.kill().await;
+            }
+        }
+    }
+}
+
+use crate::types::AgentBackend;
+
+/// Sessions for a workspace - can have multiple backends connected simultaneously
+pub(crate) type WorkspaceSessions = HashMap<AgentBackend, AgentSession>;
+
 pub(crate) struct AppState {
     pub(crate) workspaces: Mutex<HashMap<String, WorkspaceEntry>>,
-    pub(crate) sessions: Mutex<HashMap<String, Arc<crate::codex::WorkspaceSession>>>,
+    /// Maps workspace_id -> backend -> session (supports multiple backends per workspace)
+    pub(crate) sessions: Mutex<HashMap<String, WorkspaceSessions>>,
     pub(crate) terminal_sessions:
         Mutex<HashMap<String, Arc<crate::terminal::TerminalSession>>>,
     pub(crate) remote_backend: Mutex<Option<crate::remote_backend::RemoteBackend>>,

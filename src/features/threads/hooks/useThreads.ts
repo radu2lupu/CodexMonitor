@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type {
+  AgentBackend,
   ApprovalRequest,
   AppServerEvent,
   ConversationItem,
@@ -996,6 +997,37 @@ export function useThreads({
         pushThreadErrorMessage(threadId, message);
         safeMessageActivity();
       },
+      onClaudeHistory: (
+        workspaceId: string,
+        sessionId: string,
+        messages: { type: "user" | "assistant"; id: string; content: string; timestamp?: string }[],
+      ) => {
+        console.log("[onClaudeHistory] Received:", { workspaceId, sessionId, messageCount: messages.length });
+        const threadId = `claude-${sessionId}`;
+        dispatch({ type: "ensureThread", workspaceId, threadId });
+        const items: ConversationItem[] = messages.map((msg) => ({
+          id: msg.id,
+          kind: "message" as const,
+          role: msg.type === "user" ? ("user" as const) : ("assistant" as const),
+          text: msg.content,
+        }));
+        console.log("[onClaudeHistory] Created items:", items.length, "for thread:", threadId);
+        if (items.length > 0) {
+          dispatch({ type: "setThreadItems", threadId, items });
+          const lastAssistantMsg = [...messages]
+            .reverse()
+            .find((m) => m.type === "assistant");
+          if (lastAssistantMsg) {
+            dispatch({
+              type: "setLastAgentMessage",
+              threadId,
+              text: lastAssistantMsg.content,
+              timestamp: Date.now(),
+            });
+          }
+        }
+        safeMessageActivity();
+      },
     }),
     [
       activeThreadId,
@@ -1014,17 +1046,17 @@ export function useThreads({
   useAppServerEvents(handlers);
 
   const startThreadForWorkspace = useCallback(
-    async (workspaceId: string, options?: { activate?: boolean }) => {
+    async (workspaceId: string, options?: { activate?: boolean; backend?: "codex" | "claudecode" }) => {
       const shouldActivate = options?.activate !== false;
       onDebug?.({
         id: `${Date.now()}-client-thread-start`,
         timestamp: Date.now(),
         source: "client",
         label: "thread/start",
-        payload: { workspaceId },
+        payload: { workspaceId, backend: options?.backend },
       });
       try {
-        const response = await startThreadService(workspaceId);
+        const response = await startThreadService(workspaceId, options?.backend);
         onDebug?.({
           id: `${Date.now()}-server-thread-start`,
           timestamp: Date.now(),
@@ -1057,11 +1089,11 @@ export function useThreads({
     [onDebug],
   );
 
-  const startThread = useCallback(async () => {
+  const startThread = useCallback(async (backend?: "codex" | "claudecode") => {
     if (!activeWorkspaceId) {
       return null;
     }
-    return startThreadForWorkspace(activeWorkspaceId);
+    return startThreadForWorkspace(activeWorkspaceId, { backend });
   }, [activeWorkspaceId, startThreadForWorkspace]);
 
   const resumeThreadForWorkspace = useCallback(
@@ -1270,10 +1302,12 @@ export function useThreads({
                   ? `${preview.slice(0, 38)}…`
                   : preview
                 : fallbackName;
+            const backend = asString(thread?.backend ?? "") as AgentBackend | "";
             return {
               id,
               name,
               updatedAt: getThreadTimestamp(thread),
+              backend: backend || undefined,
             };
           })
           .filter((entry) => entry.id);
@@ -1396,7 +1430,8 @@ export function useThreads({
                 ? `${preview.slice(0, 38)}…`
                 : preview
               : fallbackName;
-          additions.push({ id, name, updatedAt: getThreadTimestamp(thread) });
+          const backend = asString(thread?.backend ?? "") as AgentBackend | "";
+          additions.push({ id, name, updatedAt: getThreadTimestamp(thread), backend: backend || undefined });
           existingIds.add(id);
         });
 

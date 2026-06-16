@@ -31,7 +31,8 @@ use backend::app_server::{spawn_workspace_session, WorkspaceSession};
 use backend::events::{AppServerEvent, EventSink, TerminalOutput};
 use storage::{read_settings, read_workspaces, write_settings, write_workspaces};
 use types::{
-    AppSettings, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings, WorktreeInfo,
+    AgentBackend, AppSettings, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings,
+    WorktreeInfo,
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:4732";
@@ -120,6 +121,7 @@ impl DaemonState {
                 parent_id: entry.parent_id.clone(),
                 worktree: entry.worktree.clone(),
                 settings: entry.settings.clone(),
+                agent_backend: entry.agent_backend.clone(),
             });
         }
         sort_workspaces(&mut result);
@@ -147,6 +149,7 @@ impl DaemonState {
             parent_id: None,
             worktree: None,
             settings: WorkspaceSettings::default(),
+            agent_backend: AgentBackend::default(),
         };
 
         let default_bin = {
@@ -183,6 +186,7 @@ impl DaemonState {
             parent_id: entry.parent_id,
             worktree: entry.worktree,
             settings: entry.settings,
+            agent_backend: entry.agent_backend,
         })
     }
 
@@ -250,6 +254,7 @@ impl DaemonState {
                 branch: branch.to_string(),
             }),
             settings: WorkspaceSettings::default(),
+            agent_backend: parent_entry.agent_backend.clone(),
         };
 
         let default_bin = {
@@ -286,6 +291,7 @@ impl DaemonState {
             parent_id: entry.parent_id,
             worktree: entry.worktree,
             settings: entry.settings,
+            agent_backend: entry.agent_backend,
         })
     }
 
@@ -425,6 +431,7 @@ impl DaemonState {
             parent_id: entry_snapshot.parent_id,
             worktree: entry_snapshot.worktree,
             settings: entry_snapshot.settings,
+            agent_backend: entry_snapshot.agent_backend,
         })
     }
 
@@ -458,6 +465,7 @@ impl DaemonState {
             parent_id: entry_snapshot.parent_id,
             worktree: entry_snapshot.worktree,
             settings: entry_snapshot.settings,
+            agent_backend: entry_snapshot.agent_backend,
         })
     }
 

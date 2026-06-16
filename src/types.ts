@@ -14,6 +14,8 @@ export type WorkspaceGroup = {
 
 export type WorkspaceKind = "main" | "worktree";
 
+export type AgentBackend = "codex" | "claudecode";
+
 export type WorktreeInfo = {
   branch: string;
 };
@@ -28,6 +30,7 @@ export type WorkspaceInfo = {
   parentId?: string | null;
   worktree?: WorktreeInfo | null;
   settings: WorkspaceSettings;
+  agentBackend?: AgentBackend;
 };
 
 export type AppServerEvent = {
@@ -61,6 +64,7 @@ export type ThreadSummary = {
   id: string;
   name: string;
   updatedAt: number;
+  backend?: AgentBackend;
 };
 
 export type ReviewTarget =

@@ -16,12 +16,20 @@ type AgentCompleted = {
   text: string;
 };
 
+type ClaudeHistoryMessage = {
+  type: "user" | "assistant";
+  id: string;
+  content: string;
+  timestamp?: string;
+};
+
 type AppServerEventHandlers = {
   onWorkspaceConnected?: (workspaceId: string) => void;
   onApprovalRequest?: (request: ApprovalRequest) => void;
   onAgentMessageDelta?: (event: AgentDelta) => void;
   onAgentMessageCompleted?: (event: AgentCompleted) => void;
   onAppServerEvent?: (event: AppServerEvent) => void;
+  onClaudeHistory?: (workspaceId: string, sessionId: string, messages: ClaudeHistoryMessage[]) => void;
   onTurnStarted?: (workspaceId: string, threadId: string, turnId: string) => void;
   onTurnCompleted?: (workspaceId: string, threadId: string, turnId: string) => void;
   onTurnError?: (
@@ -61,6 +69,11 @@ export function useAppServerEvents(handlers: AppServerEventHandlers) {
 
       const { workspace_id, message } = payload;
       const method = String(message.method ?? "");
+
+      // Log all incoming events for debugging
+      if (method.startsWith("claude/")) {
+        console.log("[useAppServerEvents] Claude event received:", method, payload);
+      }
 
       if (method === "codex/connected") {
         handlers.onWorkspaceConnected?.(workspace_id);
@@ -253,6 +266,20 @@ export function useAppServerEvents(handlers: AppServerEventHandlers) {
         const delta = String(params.delta ?? "");
         if (threadId && itemId && delta) {
           handlers.onFileChangeOutputDelta?.(workspace_id, threadId, itemId, delta);
+        }
+        return;
+      }
+
+      if (method === "claude/history") {
+        const params = message.params as Record<string, unknown>;
+        const sessionId = String(params.sessionId ?? params.session_id ?? "");
+        const messages = params.messages as ClaudeHistoryMessage[] | undefined;
+        console.log("[claude/history] Received event:", { sessionId, messageCount: messages?.length });
+        if (sessionId && messages && Array.isArray(messages)) {
+          console.log("[claude/history] Calling handler with", messages.length, "messages");
+          handlers.onClaudeHistory?.(workspace_id, sessionId, messages);
+        } else {
+          console.log("[claude/history] Skipping - missing sessionId or messages", { sessionId, hasMessages: !!messages, isArray: Array.isArray(messages) });
         }
         return;
       }

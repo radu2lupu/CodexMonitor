@@ -2,6 +2,7 @@ use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem, Submenu};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod backend;
+mod claude_code_commands;
 mod codex;
 mod codex_home;
 mod codex_config;
@@ -346,7 +347,10 @@ pub fn run() {
             dictation::dictation_start,
             dictation::dictation_stop,
             dictation::dictation_cancel,
-            local_usage::local_usage_snapshot
+            local_usage::local_usage_snapshot,
+            claude_code_commands::claude_send_message,
+            claude_code_commands::claude_interrupt,
+            claude_code_commands::claude_get_session_id
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

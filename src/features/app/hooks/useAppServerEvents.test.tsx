@@ -164,4 +164,68 @@ describe("useAppServerEvents", () => {
       root.unmount();
     });
   });
+
+  it("routes claude/history events to onClaudeHistory handler", async () => {
+    const handlers: Handlers = {
+      onClaudeHistory: vi.fn(),
+    };
+    const { root } = await mount(handlers);
+
+    const messages = [
+      { type: "user" as const, id: "msg-1", content: "Hello" },
+      { type: "assistant" as const, id: "msg-2", content: "Hi there!" },
+    ];
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "claude/history",
+          params: { sessionId: "session-123", messages },
+        },
+      });
+    });
+
+    expect(handlers.onClaudeHistory).toHaveBeenCalledWith(
+      "ws-1",
+      "session-123",
+      messages,
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("ignores claude/history events missing required fields", async () => {
+    const handlers: Handlers = {
+      onClaudeHistory: vi.fn(),
+    };
+    const { root } = await mount(handlers);
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "claude/history",
+          params: { sessionId: "", messages: [] },
+        },
+      });
+    });
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "claude/history",
+          params: { sessionId: "session-123" },
+        },
+      });
+    });
+
+    expect(handlers.onClaudeHistory).not.toHaveBeenCalled();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
 });

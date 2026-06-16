@@ -28,6 +28,7 @@ import successSoundUrl from "./assets/success-notification.mp3";
 import errorSoundUrl from "./assets/error-notification.mp3";
 import { WorktreePrompt } from "./features/workspaces/components/WorktreePrompt";
 import { ClonePrompt } from "./features/workspaces/components/ClonePrompt";
+import { BackendSelectPrompt } from "./features/workspaces/components/BackendSelectPrompt";
 import { RenameThreadPrompt } from "./features/threads/components/RenameThreadPrompt";
 import { AboutView } from "./features/about/components/AboutView";
 import { SettingsView } from "./features/settings/components/SettingsView";
@@ -111,6 +112,7 @@ import {
 } from "./services/events";
 import type {
   AccessMode,
+  AgentBackend,
   GitHubPullRequest,
   QueuedMessage,
   WorkspaceInfo,
@@ -808,6 +810,40 @@ function MainApp() {
     },
   });
 
+  // Backend selection prompt state
+  const [showBackendPrompt, setShowBackendPrompt] = useState(false);
+
+  // New thread backend selection state
+  const [newThreadPrompt, setNewThreadPrompt] = useState<{
+    workspaceId: string;
+    workspace: (typeof workspaces)[number];
+  } | null>(null);
+
+  const handleBackendSelect = useCallback(
+    async (backend: AgentBackend) => {
+      setShowBackendPrompt(false);
+      try {
+        const workspace = await addWorkspace(backend);
+        if (workspace) {
+          setActiveThreadId(null, workspace.id);
+          if (isCompact) {
+            setActiveTab("codex");
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        addDebugEntry({
+          id: `${Date.now()}-client-add-workspace-error`,
+          timestamp: Date.now(),
+          source: "error",
+          label: "workspace/add error",
+          payload: message,
+        });
+      }
+    },
+    [addWorkspace, addDebugEntry, isCompact, setActiveTab, setActiveThreadId],
+  );
+
   const latestAgentRuns = useMemo(() => {
     const entries: Array<{
       threadId: string;
@@ -1239,27 +1275,9 @@ function MainApp() {
     listThreadsForWorkspace
   });
 
-  const handleAddWorkspace = useCallback(async () => {
-    try {
-      const workspace = await addWorkspace();
-      if (workspace) {
-        setActiveThreadId(null, workspace.id);
-        if (isCompact) {
-          setActiveTab("codex");
-        }
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      addDebugEntry({
-        id: `${Date.now()}-client-add-workspace-error`,
-        timestamp: Date.now(),
-        source: "error",
-        label: "workspace/add error",
-        payload: message
-      });
-      alert(`Failed to add workspace.\n\n${message}`);
-    }
-  }, [addDebugEntry, addWorkspace, isCompact, setActiveTab, setActiveThreadId]);
+  const handleAddWorkspace = useCallback(() => {
+    setShowBackendPrompt(true);
+  }, []);
 
   const handleAddAgent = useCallback(
     async (workspace: (typeof workspaces)[number]) => {
@@ -1268,7 +1286,22 @@ function MainApp() {
       if (!workspace.connected) {
         await connectWorkspace(workspace);
       }
-      await startThreadForWorkspace(workspace.id);
+      // Show backend selection prompt for new thread
+      setNewThreadPrompt({ workspaceId: workspace.id, workspace });
+    },
+    [
+      connectWorkspace,
+      exitDiffView,
+      selectWorkspace,
+    ],
+  );
+
+  const handleNewThreadBackendSelect = useCallback(
+    async (backend: AgentBackend) => {
+      if (!newThreadPrompt) return;
+      const { workspaceId } = newThreadPrompt;
+      setNewThreadPrompt(null);
+      await startThreadForWorkspace(workspaceId, { backend });
       if (isCompact) {
         setActiveTab("codex");
       }
@@ -1276,10 +1309,8 @@ function MainApp() {
       setTimeout(() => composerInputRef.current?.focus(), 0);
     },
     [
-      connectWorkspace,
-      exitDiffView,
       isCompact,
-      selectWorkspace,
+      newThreadPrompt,
       setActiveTab,
       startThreadForWorkspace,
     ],
@@ -1976,6 +2007,20 @@ function MainApp() {
           onClearCopiesFolder={clearCloneCopiesFolder}
           onCancel={cancelClonePrompt}
           onConfirm={confirmClonePrompt}
+        />
+      )}
+      {showBackendPrompt && (
+        <BackendSelectPrompt
+          onCancel={() => setShowBackendPrompt(false)}
+          onSelect={handleBackendSelect}
+        />
+      )}
+      {newThreadPrompt && (
+        <BackendSelectPrompt
+          title="New Agent Thread"
+          subtitle="Choose which AI backend to use for this thread."
+          onCancel={() => setNewThreadPrompt(null)}
+          onSelect={handleNewThreadBackendSelect}
         />
       )}
       {settingsOpen && (

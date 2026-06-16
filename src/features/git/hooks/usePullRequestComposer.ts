@@ -21,7 +21,7 @@ type UsePullRequestComposerOptions = {
   setPrefillDraft: (draft: { id: string; text: string; createdAt: number }) => void;
   setActiveTab: (tab: "projects" | "codex" | "git" | "log") => void;
   connectWorkspace: (workspace: WorkspaceInfo) => Promise<void>;
-  startThreadForWorkspace: (workspaceId: string, options?: { activate?: boolean }) => Promise<string | null>;
+  startThreadForWorkspace: (workspaceId: string, options?: { activate?: boolean; backend?: "codex" | "claudecode" }) => Promise<string | null>;
   sendUserMessageToThread: (
     workspace: WorkspaceInfo,
     threadId: string,

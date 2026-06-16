@@ -14,12 +14,61 @@ use crate::backend::app_server::{
     build_codex_command_with_bin, build_codex_path_env, check_codex_installation,
     spawn_workspace_session as spawn_workspace_session_inner,
 };
+use crate::backend::claude_code::ClaudeCodeSession;
 use crate::codex_home::{resolve_default_codex_home, resolve_workspace_codex_home};
 use crate::event_sink::TauriEventSink;
 use crate::remote_backend;
 use crate::rules;
 use crate::state::AppState;
-use crate::types::WorkspaceEntry;
+use crate::types::{AgentBackend, WorkspaceEntry};
+
+/// Helper to get a Codex session from the sessions map
+async fn get_codex_session(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<Arc<WorkspaceSession>, String> {
+    let sessions = state.sessions.lock().await;
+    let workspace_sessions = sessions
+        .get(workspace_id)
+        .ok_or("workspace not connected")?;
+    let session = workspace_sessions
+        .get(&AgentBackend::Codex)
+        .ok_or("Codex backend not connected")?;
+    session
+        .as_codex()
+        .cloned()
+        .ok_or_else(|| "session is not a Codex session".to_string())
+}
+
+/// Helper to get a Claude Code session from the sessions map
+async fn get_claude_code_session(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<Arc<ClaudeCodeSession>, String> {
+    let sessions = state.sessions.lock().await;
+    let workspace_sessions = sessions
+        .get(workspace_id)
+        .ok_or("workspace not connected")?;
+    let session = workspace_sessions
+        .get(&AgentBackend::ClaudeCode)
+        .ok_or("Claude Code backend not connected")?;
+    session
+        .as_claude_code()
+        .cloned()
+        .ok_or_else(|| "session is not a Claude Code session".to_string())
+}
+
+/// Helper to check which backends are connected for a workspace
+async fn get_connected_backends(state: &AppState, workspace_id: &str) -> Vec<AgentBackend> {
+    let sessions = state.sessions.lock().await;
+    sessions
+        .get(workspace_id)
+        .map(|ws| ws.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Thread ID prefix for Claude Code sessions
+const CLAUDE_THREAD_PREFIX: &str = "claude-";
 
 pub(crate) async fn spawn_workspace_session(
     entry: WorkspaceEntry,
@@ -134,6 +183,7 @@ pub(crate) async fn codex_doctor(
 #[tauri::command]
 pub(crate) async fn start_thread(
     workspace_id: String,
+    backend: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Value, String> {
@@ -142,20 +192,46 @@ pub(crate) async fn start_thread(
             &*state,
             app,
             "start_thread",
-            json!({ "workspaceId": workspace_id }),
+            json!({ "workspaceId": workspace_id, "backend": backend }),
         )
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
-    let params = json!({
-        "cwd": session.entry.path,
-        "approvalPolicy": "on-request"
-    });
-    session.send_request("thread/start", params).await
+    // Parse backend from string, default to codex if not specified
+    let target_backend = match backend.as_deref() {
+        Some("claudecode") => AgentBackend::ClaudeCode,
+        Some("codex") | None => AgentBackend::Codex,
+        Some(other) => return Err(format!("Unknown backend: {}", other)),
+    };
+
+    match target_backend {
+        AgentBackend::Codex => {
+            let session = get_codex_session(&*state, &workspace_id).await?;
+            let params = json!({
+                "cwd": session.entry.path,
+                "approvalPolicy": "on-request"
+            });
+            session.send_request("thread/start", params).await
+        }
+        AgentBackend::ClaudeCode => {
+            // For Claude Code, return the session as a "thread"
+            let session = get_claude_code_session(&*state, &workspace_id).await?;
+            let session_id = session.get_session_id().await.unwrap_or_else(|| {
+                format!("{}{}", CLAUDE_THREAD_PREFIX, workspace_id)
+            });
+            Ok(json!({
+                "result": {
+                    "threadId": session_id,
+                    "thread": {
+                        "id": session_id,
+                        "name": "Claude Code Session",
+                        "updatedAt": chrono::Utc::now().timestamp_millis(),
+                        "backend": "claudecode"
+                    }
+                }
+            }))
+        }
+    }
 }
 
 #[tauri::command]
@@ -175,14 +251,89 @@ pub(crate) async fn resume_thread(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
-    let params = json!({
-        "threadId": thread_id
-    });
-    session.send_request("thread/resume", params).await
+    // Determine backend from thread_id prefix
+    let is_claude = thread_id.starts_with(CLAUDE_THREAD_PREFIX);
+
+    if is_claude {
+        // Extract the actual session ID (remove the claude- prefix)
+        let claude_session_id = thread_id.strip_prefix(CLAUDE_THREAD_PREFIX).unwrap_or(&thread_id);
+        eprintln!("[resume_thread] Resuming Claude session: thread_id={}, claude_session_id={}", thread_id, claude_session_id);
+
+        // Get workspace entry and settings
+        let (entry, default_bin) = {
+            let workspaces = state.workspaces.lock().await;
+            let entry = workspaces.get(&workspace_id).cloned().ok_or("workspace not found")?;
+            let settings = state.app_settings.lock().await;
+            eprintln!("[resume_thread] Workspace: path={}, default_bin={:?}", entry.path, settings.codex_bin);
+            (entry, settings.codex_bin.clone())
+        };
+
+        // Kill the existing Claude Code session if any
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(workspace_sessions) = sessions.get_mut(&workspace_id) {
+                if let Some(old_session) = workspace_sessions.remove(&AgentBackend::ClaudeCode) {
+                    eprintln!("[resume_thread] Killing existing Claude session");
+                    old_session.kill_child().await;
+                }
+            }
+        }
+
+        // Spawn a new Claude Code session with --resume
+        eprintln!("[resume_thread] Spawning new Claude session with --resume {}", claude_session_id);
+        let event_sink = crate::event_sink::TauriEventSink::new(app.clone());
+        let new_session = crate::backend::claude_code::spawn_claude_code_session(
+            entry.clone(),
+            default_bin,
+            env!("CARGO_PKG_VERSION").to_string(),
+            event_sink,
+            Some(claude_session_id.to_string()),
+        )
+        .await?;
+
+        // Check what session ID was captured
+        let captured_session_id = new_session.get_session_id().await;
+        eprintln!("[resume_thread] New session captured session_id: {:?}", captured_session_id);
+
+        // Store the new session
+        {
+            let mut sessions = state.sessions.lock().await;
+            let workspace_sessions = sessions.entry(workspace_id.clone()).or_insert_with(std::collections::HashMap::new);
+            workspace_sessions.insert(AgentBackend::ClaudeCode, crate::state::AgentSession::ClaudeCode(new_session));
+        }
+
+        // Load and emit the session history
+        let event_sink = crate::event_sink::TauriEventSink::new(app.clone());
+        if let Err(e) = crate::backend::claude_code::load_session_history(
+            &workspace_id,
+            &entry.path,
+            claude_session_id,
+            &event_sink,
+        ).await {
+            eprintln!("[resume_thread] Failed to load session history: {}", e);
+        }
+
+        let response = json!({
+            "result": {
+                "threadId": thread_id,
+                "thread": {
+                    "id": thread_id,
+                    "preview": "Claude Code Session",
+                    "updatedAt": chrono::Utc::now().timestamp_millis(),
+                    "backend": "claudecode",
+                    "cwd": entry.path
+                }
+            }
+        });
+        eprintln!("[resume_thread] Returning response: {}", response);
+        Ok(response)
+    } else {
+        let session = get_codex_session(&*state, &workspace_id).await?;
+        let params = json!({
+            "threadId": thread_id
+        });
+        session.send_request("thread/resume", params).await
+    }
 }
 
 #[tauri::command]
@@ -203,15 +354,109 @@ pub(crate) async fn list_threads(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
-    let params = json!({
-        "cursor": cursor,
-        "limit": limit,
+    // Aggregate threads from all connected backends
+    let connected_backends = get_connected_backends(&*state, &workspace_id).await;
+    let mut all_threads: Vec<Value> = Vec::new();
+
+    // Get Codex threads if connected
+    if connected_backends.contains(&AgentBackend::Codex) {
+        if let Ok(session) = get_codex_session(&*state, &workspace_id).await {
+            let params = json!({
+                "cursor": cursor,
+                "limit": limit,
+            });
+            if let Ok(result) = session.send_request("thread/list", params).await {
+                // Try both "data" and "threads" keys since Codex uses "data"
+                let threads = result
+                    .get("result")
+                    .and_then(|r| r.get("data").or_else(|| r.get("threads")))
+                    .and_then(|t| t.as_array());
+                if let Some(threads) = threads {
+                    // Add backend info to each thread
+                    for thread in threads {
+                        let mut thread_with_backend = thread.clone();
+                        if let Some(obj) = thread_with_backend.as_object_mut() {
+                            obj.insert("backend".to_string(), json!("codex"));
+                        }
+                        all_threads.push(thread_with_backend);
+                    }
+                }
+            }
+        }
+    }
+
+    // Get Claude Code sessions from history file
+    if connected_backends.contains(&AgentBackend::ClaudeCode) {
+        // Get workspace path for filtering sessions
+        let workspace_path = {
+            let workspaces = state.workspaces.lock().await;
+            workspaces.get(&workspace_id).map(|e| e.path.clone()).unwrap_or_default()
+        };
+
+        // Read Claude Code history file to get sessions for this workspace
+        if let Ok(home) = std::env::var("HOME") {
+            let history_path = PathBuf::from(&home).join(".claude").join("history.jsonl");
+            if let Ok(content) = tokio::fs::read_to_string(&history_path).await {
+                // Parse history entries and group by session ID
+                // Track: (first_display, first_timestamp, last_timestamp)
+                let mut sessions: std::collections::HashMap<String, (String, i64, i64)> = std::collections::HashMap::new();
+
+                for line in content.lines() {
+                    if let Ok(entry) = serde_json::from_str::<Value>(line) {
+                        let project = entry.get("project").and_then(|p| p.as_str()).unwrap_or("");
+                        let session_id = entry.get("sessionId").and_then(|s| s.as_str()).unwrap_or("");
+                        let display = entry.get("display").and_then(|d| d.as_str()).unwrap_or("").trim();
+                        let timestamp = entry.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
+
+                        // Check if this session belongs to our workspace
+                        if !session_id.is_empty() && project == workspace_path {
+                            sessions.entry(session_id.to_string())
+                                .and_modify(|(name, first_ts, last_ts)| {
+                                    // Update last timestamp if newer
+                                    if timestamp > *last_ts {
+                                        *last_ts = timestamp;
+                                    }
+                                    // Use the earliest display as the name
+                                    if timestamp < *first_ts {
+                                        *name = display.to_string();
+                                        *first_ts = timestamp;
+                                    }
+                                })
+                                .or_insert_with(|| {
+                                    (display.to_string(), timestamp, timestamp)
+                                });
+                        }
+                    }
+                }
+
+                // Add sessions to all_threads
+                for (session_id, (display, _, last_timestamp)) in sessions {
+                    let thread_id = format!("{}{}", CLAUDE_THREAD_PREFIX, session_id);
+                    all_threads.push(json!({
+                        "id": thread_id,
+                        "preview": display,  // Frontend uses "preview" for thread names
+                        "updatedAt": last_timestamp,
+                        "backend": "claudecode",
+                        "cwd": workspace_path
+                    }));
+                }
+            }
+        }
+    }
+
+    // Sort by updatedAt descending (most recent first)
+    all_threads.sort_by(|a, b| {
+        let a_time = a.get("updatedAt").and_then(|t| t.as_i64()).unwrap_or(0);
+        let b_time = b.get("updatedAt").and_then(|t| t.as_i64()).unwrap_or(0);
+        b_time.cmp(&a_time)
     });
-    session.send_request("thread/list", params).await
+
+    Ok(json!({
+        "result": {
+            "data": all_threads,
+            "hasMore": false
+        }
+    }))
 }
 
 #[tauri::command]
@@ -231,14 +476,25 @@ pub(crate) async fn archive_thread(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
-    let params = json!({
-        "threadId": thread_id
-    });
-    session.send_request("thread/archive", params).await
+    // Determine backend from thread_id prefix
+    let is_claude = thread_id.starts_with(CLAUDE_THREAD_PREFIX);
+
+    if is_claude {
+        // Claude Code doesn't have a thread archiving concept
+        // Return success as a no-op
+        Ok(json!({
+            "result": {
+                "ok": true,
+                "threadId": thread_id,
+            }
+        }))
+    } else {
+        let session = get_codex_session(&*state, &workspace_id).await?;
+        let params = json!({
+            "threadId": thread_id
+        });
+        session.send_request("thread/archive", params).await
+    }
 }
 
 #[tauri::command]
@@ -273,67 +529,88 @@ pub(crate) async fn send_user_message(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
-    let access_mode = access_mode.unwrap_or_else(|| "current".to_string());
-    let sandbox_policy = match access_mode.as_str() {
-        "full-access" => json!({
-            "type": "dangerFullAccess"
-        }),
-        "read-only" => json!({
-            "type": "readOnly"
-        }),
-        _ => json!({
-            "type": "workspaceWrite",
-            "writableRoots": [session.entry.path],
-            "networkAccess": true
-        }),
-    };
+    // Determine backend from thread_id prefix
+    let is_claude = thread_id.starts_with(CLAUDE_THREAD_PREFIX);
 
-    let approval_policy = if access_mode == "full-access" {
-        "never"
-    } else {
-        "on-request"
-    };
-
-    let trimmed_text = text.trim();
-    let mut input: Vec<Value> = Vec::new();
-    if !trimmed_text.is_empty() {
-        input.push(json!({ "type": "text", "text": trimmed_text }));
-    }
-    if let Some(paths) = images {
-        for path in paths {
-            let trimmed = path.trim();
-            if trimmed.is_empty() {
-                continue;
+    if is_claude {
+        let session = get_claude_code_session(&*state, &workspace_id).await?;
+        let trimmed_text = text.trim();
+        if trimmed_text.is_empty() {
+            return Err("empty user message".to_string());
+        }
+        // Send user message to Claude Code
+        session.send_user_message(trimmed_text).await?;
+        // Return a success response with turn info
+        let session_id = session.get_session_id().await.unwrap_or_else(|| {
+            format!("{}{}", CLAUDE_THREAD_PREFIX, workspace_id)
+        });
+        let turn_id = format!("turn-{}", chrono::Utc::now().timestamp_millis());
+        Ok(json!({
+            "result": {
+                "turnId": turn_id,
+                "threadId": session_id,
             }
-            if trimmed.starts_with("data:")
-                || trimmed.starts_with("http://")
-                || trimmed.starts_with("https://")
-            {
-                input.push(json!({ "type": "image", "url": trimmed }));
-            } else {
-                input.push(json!({ "type": "localImage", "path": trimmed }));
+        }))
+    } else {
+        let session = get_codex_session(&*state, &workspace_id).await?;
+        let access_mode = access_mode.unwrap_or_else(|| "current".to_string());
+        let sandbox_policy = match access_mode.as_str() {
+            "full-access" => json!({
+                "type": "dangerFullAccess"
+            }),
+            "read-only" => json!({
+                "type": "readOnly"
+            }),
+            _ => json!({
+                "type": "workspaceWrite",
+                "writableRoots": [session.entry.path],
+                "networkAccess": true
+            }),
+        };
+
+        let approval_policy = if access_mode == "full-access" {
+            "never"
+        } else {
+            "on-request"
+        };
+
+        let trimmed_text = text.trim();
+        let mut input: Vec<Value> = Vec::new();
+        if !trimmed_text.is_empty() {
+            input.push(json!({ "type": "text", "text": trimmed_text }));
+        }
+        if let Some(paths) = images {
+            for path in paths {
+                let trimmed = path.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with("data:")
+                    || trimmed.starts_with("http://")
+                    || trimmed.starts_with("https://")
+                {
+                    input.push(json!({ "type": "image", "url": trimmed }));
+                } else {
+                    input.push(json!({ "type": "localImage", "path": trimmed }));
+                }
             }
         }
-    }
-    if input.is_empty() {
-        return Err("empty user message".to_string());
-    }
+        if input.is_empty() {
+            return Err("empty user message".to_string());
+        }
 
-    let params = json!({
-        "threadId": thread_id,
-        "input": input,
-        "cwd": session.entry.path,
-        "approvalPolicy": approval_policy,
-        "sandboxPolicy": sandbox_policy,
-        "model": model,
-        "effort": effort,
-        "collaborationMode": collaboration_mode,
-    });
-    session.send_request("turn/start", params).await
+        let params = json!({
+            "threadId": thread_id,
+            "input": input,
+            "cwd": session.entry.path,
+            "approvalPolicy": approval_policy,
+            "sandboxPolicy": sandbox_policy,
+            "model": model,
+            "effort": effort,
+            "collaborationMode": collaboration_mode,
+        });
+        session.send_request("turn/start", params).await
+    }
 }
 
 #[tauri::command]
@@ -352,10 +629,7 @@ pub(crate) async fn collaboration_mode_list(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
+    let session = get_codex_session(&*state, &workspace_id).await?;
     session
         .send_request("collaborationMode/list", json!({}))
         .await
@@ -379,15 +653,27 @@ pub(crate) async fn turn_interrupt(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
-    let params = json!({
-        "threadId": thread_id,
-        "turnId": turn_id,
-    });
-    session.send_request("turn/interrupt", params).await
+    // Determine backend from thread_id prefix
+    let is_claude = thread_id.starts_with(CLAUDE_THREAD_PREFIX);
+
+    if is_claude {
+        let session = get_claude_code_session(&*state, &workspace_id).await?;
+        // Send abort control message to Claude Code
+        session.send_control("abort").await?;
+        Ok(json!({
+            "result": {
+                "ok": true,
+                "turnId": turn_id,
+            }
+        }))
+    } else {
+        let session = get_codex_session(&*state, &workspace_id).await?;
+        let params = json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+        });
+        session.send_request("turn/interrupt", params).await
+    }
 }
 
 #[tauri::command]
@@ -414,10 +700,7 @@ pub(crate) async fn start_review(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
+    let session = get_codex_session(&*state, &workspace_id).await?;
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
     params.insert("target".to_string(), target);
@@ -445,10 +728,7 @@ pub(crate) async fn model_list(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
+    let session = get_codex_session(&*state, &workspace_id).await?;
     let params = json!({});
     session.send_request("model/list", params).await
 }
@@ -469,10 +749,7 @@ pub(crate) async fn account_rate_limits(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
+    let session = get_codex_session(&*state, &workspace_id).await?;
     session
         .send_request("account/rateLimits/read", Value::Null)
         .await
@@ -494,10 +771,7 @@ pub(crate) async fn skills_list(
         .await;
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
+    let session = get_codex_session(&*state, &workspace_id).await?;
     let params = json!({
         "cwd": session.entry.path
     });
@@ -523,10 +797,7 @@ pub(crate) async fn respond_to_server_request(
         return Ok(());
     }
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&workspace_id)
-        .ok_or("workspace not connected")?;
+    let session = get_codex_session(&*state, &workspace_id).await?;
     session.send_response(request_id, result).await
 }
 
@@ -616,14 +887,8 @@ Only output the commit message, nothing else.\n\n\
 Changes:\n{diff}"
     );
 
-    // Get the session
-    let session = {
-        let sessions = state.sessions.lock().await;
-        sessions
-            .get(&workspace_id)
-            .ok_or("workspace not connected")?
-            .clone()
-    };
+    // Get the session (currently only Codex supports this)
+    let session = get_codex_session(&*state, &workspace_id).await?;
 
     // Create a background thread
     let thread_params = json!({

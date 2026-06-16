@@ -488,6 +488,25 @@
   opacity: 1;
 }
 
+.thread-backend-badge {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 3px;
+  margin-right: 4px;
+  flex-shrink: 0;
+}
+
+.thread-backend-badge.claude {
+  background: rgba(204, 120, 50, 0.3);
+  color: #cc7832;
+}
+
+.thread-backend-badge.codex {
+  background: rgba(50, 160, 120, 0.3);
+  color: #32a078;
+}
+
 .thread-status.processing {
   background: #ff9f43;
   box-shadow: 0 0 8px rgba(255, 159, 67, 0.8);

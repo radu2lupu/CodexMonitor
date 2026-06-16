@@ -9,14 +9,16 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::backend::claude_code::spawn_claude_code_session;
 use crate::codex::spawn_workspace_session;
 use crate::codex_home::resolve_workspace_codex_home;
+use crate::event_sink::TauriEventSink;
 use crate::remote_backend;
-use crate::state::AppState;
+use crate::state::{AgentSession, AppState};
 use crate::git_utils::resolve_git_root;
 use crate::storage::write_workspaces;
 use crate::types::{
-    WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings, WorktreeInfo,
+    AgentBackend, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings, WorktreeInfo,
 };
 use crate::utils::normalize_git_path;
 
@@ -264,16 +266,22 @@ pub(crate) async fn list_workspaces(
     let sessions = state.sessions.lock().await;
     let mut result = Vec::new();
     for entry in workspaces.values() {
+        // Connected if any backend has a session
+        let connected = sessions
+            .get(&entry.id)
+            .map(|ws| !ws.is_empty())
+            .unwrap_or(false);
         result.push(WorkspaceInfo {
             id: entry.id.clone(),
             name: entry.name.clone(),
             path: entry.path.clone(),
             codex_bin: entry.codex_bin.clone(),
-            connected: sessions.contains_key(&entry.id),
+            connected,
             kind: entry.kind.clone(),
             parent_id: entry.parent_id.clone(),
             worktree: entry.worktree.clone(),
             settings: entry.settings.clone(),
+            agent_backend: entry.agent_backend.clone(),
         });
     }
     sort_workspaces(&mut result);
@@ -284,15 +292,19 @@ pub(crate) async fn list_workspaces(
 pub(crate) async fn add_workspace(
     path: String,
     codex_bin: Option<String>,
+    agent_backend: Option<AgentBackend>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<WorkspaceInfo, String> {
+    // agent_backend is now optional and only used as a preference hint
+    let preferred_backend = agent_backend.unwrap_or_default();
+
     if remote_backend::is_remote_mode(&*state).await {
         let response = remote_backend::call_remote(
             &*state,
-            app,
+            app.clone(),
             "add_workspace",
-            json!({ "path": path, "codex_bin": codex_bin }),
+            json!({ "path": path, "codex_bin": codex_bin, "agent_backend": preferred_backend }),
         )
         .await?;
         return serde_json::from_value(response).map_err(|err| err.to_string());
@@ -312,14 +324,51 @@ pub(crate) async fn add_workspace(
         parent_id: None,
         worktree: None,
         settings: WorkspaceSettings::default(),
+        agent_backend: preferred_backend.clone(),
     };
 
     let default_bin = {
         let settings = state.app_settings.lock().await;
         settings.codex_bin.clone()
     };
+
+    // Try to connect both backends - continue even if one fails
+    let mut workspace_sessions: HashMap<AgentBackend, AgentSession> = HashMap::new();
+
+    // Try Codex
     let codex_home = resolve_workspace_codex_home(&entry, None);
-    let session = spawn_workspace_session(entry.clone(), default_bin, app, codex_home).await?;
+    match spawn_workspace_session(entry.clone(), default_bin.clone(), app.clone(), codex_home).await {
+        Ok(session) => {
+            workspace_sessions.insert(AgentBackend::Codex, AgentSession::Codex(session));
+        }
+        Err(e) => {
+            eprintln!("Failed to connect Codex backend: {}", e);
+        }
+    }
+
+    // Try Claude Code
+    let event_sink = TauriEventSink::new(app.clone());
+    match spawn_claude_code_session(
+        entry.clone(),
+        default_bin,
+        env!("CARGO_PKG_VERSION").to_string(),
+        event_sink,
+        None,
+    )
+    .await
+    {
+        Ok(session) => {
+            workspace_sessions.insert(AgentBackend::ClaudeCode, AgentSession::ClaudeCode(session));
+        }
+        Err(e) => {
+            eprintln!("Failed to connect Claude Code backend: {}", e);
+        }
+    }
+
+    // At least one backend must connect
+    if workspace_sessions.is_empty() {
+        return Err("Failed to connect to any backend. Make sure either Codex or Claude Code CLI is installed.".to_string());
+    }
 
     if let Err(error) = {
         let mut workspaces = state.workspaces.lock().await;
@@ -331,27 +380,31 @@ pub(crate) async fn add_workspace(
             let mut workspaces = state.workspaces.lock().await;
             workspaces.remove(&entry.id);
         }
-        let mut child = session.child.lock().await;
-        let _ = child.kill().await;
+        // Kill all connected sessions
+        for session in workspace_sessions.values() {
+            session.kill_child().await;
+        }
         return Err(error);
     }
 
+    let connected = !workspace_sessions.is_empty();
     state
         .sessions
         .lock()
         .await
-        .insert(entry.id.clone(), session);
+        .insert(entry.id.clone(), workspace_sessions);
 
     Ok(WorkspaceInfo {
         id: entry.id,
         name: entry.name,
         path: entry.path,
         codex_bin: entry.codex_bin,
-        connected: true,
+        connected,
         kind: entry.kind,
         parent_id: entry.parent_id,
         worktree: entry.worktree,
         settings: entry.settings,
+        agent_backend: entry.agent_backend,
     })
 }
 
@@ -430,20 +483,51 @@ pub(crate) async fn add_clone(
             group_id: inherited_group_id,
             ..WorkspaceSettings::default()
         },
+        agent_backend: source_entry.agent_backend.clone(),
     };
 
     let default_bin = {
         let settings = state.app_settings.lock().await;
         settings.codex_bin.clone()
     };
+
+    // Try to connect both backends
+    let mut workspace_sessions: HashMap<AgentBackend, AgentSession> = HashMap::new();
+
+    // Try Codex
     let codex_home = resolve_workspace_codex_home(&entry, None);
-    let session = match spawn_workspace_session(entry.clone(), default_bin, app, codex_home).await {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = tokio::fs::remove_dir_all(&destination_path).await;
-            return Err(error);
+    match spawn_workspace_session(entry.clone(), default_bin.clone(), app.clone(), codex_home).await {
+        Ok(session) => {
+            workspace_sessions.insert(AgentBackend::Codex, AgentSession::Codex(session));
         }
-    };
+        Err(e) => {
+            eprintln!("Failed to connect Codex backend: {}", e);
+        }
+    }
+
+    // Try Claude Code
+    let event_sink = TauriEventSink::new(app.clone());
+    match spawn_claude_code_session(
+        entry.clone(),
+        default_bin,
+        env!("CARGO_PKG_VERSION").to_string(),
+        event_sink,
+        None,
+    )
+    .await
+    {
+        Ok(session) => {
+            workspace_sessions.insert(AgentBackend::ClaudeCode, AgentSession::ClaudeCode(session));
+        }
+        Err(e) => {
+            eprintln!("Failed to connect Claude Code backend: {}", e);
+        }
+    }
+
+    if workspace_sessions.is_empty() {
+        let _ = tokio::fs::remove_dir_all(&destination_path).await;
+        return Err("Failed to connect to any backend.".to_string());
+    }
 
     if let Err(error) = {
         let mut workspaces = state.workspaces.lock().await;
@@ -455,28 +539,31 @@ pub(crate) async fn add_clone(
             let mut workspaces = state.workspaces.lock().await;
             workspaces.remove(&entry.id);
         }
-        let mut child = session.child.lock().await;
-        let _ = child.kill().await;
+        for session in workspace_sessions.values() {
+            session.kill_child().await;
+        }
         let _ = tokio::fs::remove_dir_all(&destination_path).await;
         return Err(error);
     }
 
+    let connected = !workspace_sessions.is_empty();
     state
         .sessions
         .lock()
         .await
-        .insert(entry.id.clone(), session);
+        .insert(entry.id.clone(), workspace_sessions);
 
     Ok(WorkspaceInfo {
         id: entry.id,
         name: entry.name,
         path: entry.path,
         codex_bin: entry.codex_bin,
-        connected: true,
+        connected,
         kind: entry.kind,
         parent_id: entry.parent_id,
         worktree: entry.worktree,
         settings: entry.settings,
+        agent_backend: entry.agent_backend,
     })
 }
 
@@ -543,36 +630,76 @@ pub(crate) async fn add_worktree(
             branch: branch.to_string(),
         }),
         settings: WorkspaceSettings::default(),
+        agent_backend: parent_entry.agent_backend.clone(),
     };
 
     let default_bin = {
         let settings = state.app_settings.lock().await;
         settings.codex_bin.clone()
     };
+
+    // Try to connect both backends
+    let mut workspace_sessions: HashMap<AgentBackend, AgentSession> = HashMap::new();
+
+    // Try Codex
     let codex_home = resolve_workspace_codex_home(&entry, Some(&parent_entry.path));
-    let session = spawn_workspace_session(entry.clone(), default_bin, app, codex_home).await?;
+    match spawn_workspace_session(entry.clone(), default_bin.clone(), app.clone(), codex_home).await {
+        Ok(session) => {
+            workspace_sessions.insert(AgentBackend::Codex, AgentSession::Codex(session));
+        }
+        Err(e) => {
+            eprintln!("Failed to connect Codex backend: {}", e);
+        }
+    }
+
+    // Try Claude Code
+    let event_sink = TauriEventSink::new(app.clone());
+    match spawn_claude_code_session(
+        entry.clone(),
+        default_bin,
+        env!("CARGO_PKG_VERSION").to_string(),
+        event_sink,
+        None,
+    )
+    .await
+    {
+        Ok(session) => {
+            workspace_sessions.insert(AgentBackend::ClaudeCode, AgentSession::ClaudeCode(session));
+        }
+        Err(e) => {
+            eprintln!("Failed to connect Claude Code backend: {}", e);
+        }
+    }
+
+    if workspace_sessions.is_empty() {
+        return Err("Failed to connect to any backend.".to_string());
+    }
+
     {
         let mut workspaces = state.workspaces.lock().await;
         workspaces.insert(entry.id.clone(), entry.clone());
         let list: Vec<_> = workspaces.values().cloned().collect();
         write_workspaces(&state.storage_path, &list)?;
     }
+
+    let connected = !workspace_sessions.is_empty();
     state
         .sessions
         .lock()
         .await
-        .insert(entry.id.clone(), session);
+        .insert(entry.id.clone(), workspace_sessions);
 
     Ok(WorkspaceInfo {
         id: entry.id,
         name: entry.name,
         path: entry.path,
         codex_bin: entry.codex_bin,
-        connected: true,
+        connected,
         kind: entry.kind,
         parent_id: entry.parent_id,
         worktree: entry.worktree,
         settings: entry.settings,
+        agent_backend: entry.agent_backend,
     })
 }
 
@@ -600,9 +727,11 @@ pub(crate) async fn remove_workspace(
 
     let parent_path = PathBuf::from(&entry.path);
     for child in &child_worktrees {
-        if let Some(session) = state.sessions.lock().await.remove(&child.id) {
-            let mut child_process = session.child.lock().await;
-            let _ = child_process.kill().await;
+        // Kill all sessions for this child workspace
+        if let Some(workspace_sessions) = state.sessions.lock().await.remove(&child.id) {
+            for session in workspace_sessions.values() {
+                session.kill_child().await;
+            }
         }
         let child_path = PathBuf::from(&child.path);
         if child_path.exists() {
@@ -615,9 +744,11 @@ pub(crate) async fn remove_workspace(
     }
     let _ = run_git_command(&parent_path, &["worktree", "prune", "--expire", "now"]).await;
 
-    if let Some(session) = state.sessions.lock().await.remove(&id) {
-        let mut child = session.child.lock().await;
-        let _ = child.kill().await;
+    // Kill all sessions for this workspace
+    if let Some(workspace_sessions) = state.sessions.lock().await.remove(&id) {
+        for session in workspace_sessions.values() {
+            session.kill_child().await;
+        }
     }
 
     {
@@ -658,9 +789,11 @@ pub(crate) async fn remove_worktree(
         (entry, parent)
     };
 
-    if let Some(session) = state.sessions.lock().await.remove(&entry.id) {
-        let mut child = session.child.lock().await;
-        let _ = child.kill().await;
+    // Kill all sessions for this workspace
+    if let Some(workspace_sessions) = state.sessions.lock().await.remove(&entry.id) {
+        for session in workspace_sessions.values() {
+            session.kill_child().await;
+        }
     }
 
     let parent_path = PathBuf::from(&parent.path);
@@ -825,7 +958,13 @@ pub(crate) async fn update_workspace_settings(
     };
     write_workspaces(&state.storage_path, &list)?;
 
-    let connected = state.sessions.lock().await.contains_key(&id);
+    let connected = state
+        .sessions
+        .lock()
+        .await
+        .get(&id)
+        .map(|ws| !ws.is_empty())
+        .unwrap_or(false);
     Ok(WorkspaceInfo {
         id: entry_snapshot.id,
         name: entry_snapshot.name,
@@ -836,6 +975,7 @@ pub(crate) async fn update_workspace_settings(
         parent_id: entry_snapshot.parent_id,
         worktree: entry_snapshot.worktree,
         settings: entry_snapshot.settings,
+        agent_backend: entry_snapshot.agent_backend,
     })
 }
 
@@ -859,7 +999,13 @@ pub(crate) async fn update_workspace_codex_bin(
     };
     write_workspaces(&state.storage_path, &list)?;
 
-    let connected = state.sessions.lock().await.contains_key(&id);
+    let connected = state
+        .sessions
+        .lock()
+        .await
+        .get(&id)
+        .map(|ws| !ws.is_empty())
+        .unwrap_or(false);
     Ok(WorkspaceInfo {
         id: entry_snapshot.id,
         name: entry_snapshot.name,
@@ -870,6 +1016,7 @@ pub(crate) async fn update_workspace_codex_bin(
         parent_id: entry_snapshot.parent_id,
         worktree: entry_snapshot.worktree,
         settings: entry_snapshot.settings,
+        agent_backend: entry_snapshot.agent_backend,
     })
 }
 
@@ -880,7 +1027,7 @@ pub(crate) async fn connect_workspace(
     app: AppHandle,
 ) -> Result<(), String> {
     if remote_backend::is_remote_mode(&*state).await {
-        remote_backend::call_remote(&*state, app, "connect_workspace", json!({ "id": id }))
+        remote_backend::call_remote(&*state, app.clone(), "connect_workspace", json!({ "id": id }))
             .await?;
         return Ok(());
     }
@@ -905,9 +1052,45 @@ pub(crate) async fn connect_workspace(
         let settings = state.app_settings.lock().await;
         settings.codex_bin.clone()
     };
+
+    // Try to connect both backends
+    let mut workspace_sessions: HashMap<AgentBackend, AgentSession> = HashMap::new();
+
+    // Try Codex
     let codex_home = resolve_workspace_codex_home(&entry, parent_path.as_deref());
-    let session = spawn_workspace_session(entry.clone(), default_bin, app, codex_home).await?;
-    state.sessions.lock().await.insert(entry.id, session);
+    match spawn_workspace_session(entry.clone(), default_bin.clone(), app.clone(), codex_home).await {
+        Ok(session) => {
+            workspace_sessions.insert(AgentBackend::Codex, AgentSession::Codex(session));
+        }
+        Err(e) => {
+            eprintln!("Failed to connect Codex backend: {}", e);
+        }
+    }
+
+    // Try Claude Code
+    let event_sink = TauriEventSink::new(app.clone());
+    match spawn_claude_code_session(
+        entry.clone(),
+        default_bin,
+        env!("CARGO_PKG_VERSION").to_string(),
+        event_sink,
+        None,
+    )
+    .await
+    {
+        Ok(session) => {
+            workspace_sessions.insert(AgentBackend::ClaudeCode, AgentSession::ClaudeCode(session));
+        }
+        Err(e) => {
+            eprintln!("Failed to connect Claude Code backend: {}", e);
+        }
+    }
+
+    if workspace_sessions.is_empty() {
+        return Err("Failed to connect to any backend.".to_string());
+    }
+
+    state.sessions.lock().await.insert(entry.id, workspace_sessions);
     Ok(())
 }
 
@@ -964,7 +1147,7 @@ mod tests {
         sanitize_worktree_name, sort_workspaces,
     };
     use crate::storage::{read_workspaces, write_workspaces};
-    use crate::types::{WorktreeInfo, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings};
+    use crate::types::{AgentBackend, WorktreeInfo, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings};
     use uuid::Uuid;
 
     fn workspace(name: &str, sort_order: Option<u32>) -> WorkspaceInfo {
@@ -1002,6 +1185,7 @@ mod tests {
                 group_id: None,
                 git_root: None,
             },
+            agent_backend: AgentBackend::default(),
         }
     }
 
@@ -1143,6 +1327,7 @@ mod tests {
             parent_id: None,
             worktree: None,
             settings: WorkspaceSettings::default(),
+            agent_backend: AgentBackend::default(),
         };
         let mut workspaces = HashMap::from([(id.clone(), entry)]);
 
